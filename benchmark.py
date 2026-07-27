@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import timeit
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -96,6 +97,12 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten())
 
 
+def autocast_context(device: torch.device, mixed_precision: bool):
+    if not mixed_precision:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
 def benchmark_mode(
     mode: str,
     model: BasicsTransformerLM,
@@ -105,16 +112,18 @@ def benchmark_mode(
     warmup_steps: int,
     measurement_steps: int,
     device: torch.device,
+    mixed_precision: bool,
 ) -> list[float]:
     def run_step() -> None:
         if mode == "forward":
-            with torch.no_grad():
+            with torch.no_grad(), autocast_context(device, mixed_precision):
                 model(inputs)
             return
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(inputs)
-        loss = compute_loss(logits, targets)
+        with autocast_context(device, mixed_precision):
+            logits = model(inputs)
+            loss = compute_loss(logits, targets)
         loss.backward()
 
         if mode == "train":
@@ -156,28 +165,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rope-theta", type=float, default=10_000.0)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, mps, etc.")
     parser.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], default="float32")
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Keep model parameters in FP32 and autocast the forward pass to BF16.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument(
         "--mode",
-        choices=["all", "forward", "forward_backward", "train"],
+        choices=["all", "compare", "forward", "forward_backward", "train"],
         default="all",
-        help="train means forward + backward + optimizer step.",
+        help="compare runs forward and forward+backward; train also includes the optimizer step.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.mixed_precision and args.dtype != "float32":
+        raise ValueError("--mixed-precision requires --dtype float32 so parameters remain in FP32.")
+
     device = resolve_device(args.device)
     model = build_model(args, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     inputs, targets = make_batch(args, device)
 
-    modes = ["forward", "forward_backward", "train"] if args.mode == "all" else [args.mode]
+    if args.mode == "all":
+        modes = ["forward", "forward_backward", "train"]
+    elif args.mode == "compare":
+        modes = ["forward", "forward_backward"]
+    else:
+        modes = [args.mode]
 
-    print(f"device={device} dtype={args.dtype} size={args.size}")
+    autocast_dtype = "bfloat16" if args.mixed_precision else "disabled"
+    print(f"device={device} parameter_dtype={args.dtype} autocast={autocast_dtype} size={args.size}")
     print(
         f"batch_size={args.batch_size} context_length={args.context_length} "
         f"vocab_size={args.vocab_size} parameters={sum(p.numel() for p in model.parameters()):,}"
@@ -197,6 +220,7 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             measurement_steps=args.measurement_steps,
             device=device,
+            mixed_precision=args.mixed_precision,
         )
         print(format_stats(mode, timings))
 
