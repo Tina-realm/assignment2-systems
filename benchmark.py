@@ -5,6 +5,7 @@ import statistics
 import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,8 @@ MODEL_SIZES = {
     "xl": ModelConfig(d_model=2560, d_ff=10240, num_layers=32, num_heads=32),
     "10b": ModelConfig(d_model=4608, d_ff=12288, num_layers=50, num_heads=36),
 }
+
+MEMORY_HISTORY_MAX_ENTRIES = 1_000_000
 
 
 def synchronize(device: torch.device) -> None:
@@ -113,6 +116,7 @@ def benchmark_mode(
     measurement_steps: int,
     device: torch.device,
     mixed_precision: bool,
+    memory_snapshot: Path | None,
 ) -> list[float]:
     def run_step() -> None:
         if mode == "forward":
@@ -135,15 +139,45 @@ def benchmark_mode(
         run_step()
         synchronize(device)
 
-    timings = []
-    for _ in range(measurement_steps):
+    if mode != "forward":
+        optimizer.zero_grad(set_to_none=True)
         synchronize(device)
-        start = timeit.default_timer()
-        run_step()
-        synchronize(device)
-        timings.append(timeit.default_timer() - start)
+
+    recording_memory = memory_snapshot is not None
+    if recording_memory:
+        memory_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
+
+    try:
+        timings = []
+        for _ in range(measurement_steps):
+            synchronize(device)
+            start = timeit.default_timer()
+            run_step()
+            synchronize(device)
+            timings.append(timeit.default_timer() - start)
+
+        if recording_memory:
+            torch.cuda.memory._dump_snapshot(str(memory_snapshot))
+    finally:
+        if recording_memory:
+            torch.cuda.memory._record_memory_history(enabled=None)
 
     return timings
+
+
+def validate_memory_profile_args(args: argparse.Namespace, device: torch.device) -> None:
+    if args.memory_snapshot is None:
+        return
+    if device.type != "cuda":
+        raise ValueError("--memory-snapshot requires an NVIDIA CUDA device; MPS snapshots are not supported.")
+    if args.mode in {"all", "compare"}:
+        raise ValueError("--memory-snapshot requires one mode: forward, forward_backward, or train.")
+    if args.memory_snapshot.exists():
+        raise FileExistsError(f"Refusing to overwrite existing snapshot: {args.memory_snapshot}")
+    if args.measurement_steps != 1:
+        print("warning: use --measurement-steps 1 for a timeline containing one clearly identifiable step")
 
 
 def format_stats(mode: str, timings: list[float]) -> str:
@@ -174,6 +208,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument(
+        "--memory-snapshot",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Record CUDA memory history for the measured step and save a memory_viz pickle.",
+    )
+    parser.add_argument(
         "--mode",
         choices=["all", "compare", "forward", "forward_backward", "train"],
         default="all",
@@ -188,6 +229,7 @@ def main() -> None:
         raise ValueError("--mixed-precision requires --dtype float32 so parameters remain in FP32.")
 
     device = resolve_device(args.device)
+    validate_memory_profile_args(args, device)
     model = build_model(args, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     inputs, targets = make_batch(args, device)
@@ -221,12 +263,15 @@ def main() -> None:
             measurement_steps=args.measurement_steps,
             device=device,
             mixed_precision=args.mixed_precision,
+            memory_snapshot=args.memory_snapshot,
         )
         print(format_stats(mode, timings))
 
     if device.type == "cuda":
         peak_gib = torch.cuda.max_memory_allocated(device) / 1024**3
         print(f"peak_cuda_memory={peak_gib:.3f} GiB")
+    if args.memory_snapshot is not None:
+        print(f"memory_snapshot={args.memory_snapshot.resolve()}")
 
 
 if __name__ == "__main__":
