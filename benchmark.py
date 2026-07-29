@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import timeit
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,6 +106,28 @@ def autocast_context(device: torch.device, mixed_precision: bool):
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
 
 
+@contextmanager
+def memory_history(memory_snapshot: Path | None, device: torch.device):
+    if memory_snapshot is None:
+        yield
+        return
+
+    memory_snapshot.parent.mkdir(parents=True, exist_ok=True)
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.memory._record_memory_history(
+        enabled="all",
+        context="all",
+        stacks="all",
+        max_entries=MEMORY_HISTORY_MAX_ENTRIES,
+        device=device,
+        clear_history=True,
+    )
+    try:
+        yield
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None, device=device)
+
+
 def benchmark_mode(
     mode: str,
     model: BasicsTransformerLM,
@@ -143,26 +165,16 @@ def benchmark_mode(
         optimizer.zero_grad(set_to_none=True)
         synchronize(device)
 
-    recording_memory = memory_snapshot is not None
-    if recording_memory:
-        memory_snapshot.parent.mkdir(parents=True, exist_ok=True)
-        torch.cuda.reset_peak_memory_stats(device)
-        torch.cuda.memory._record_memory_history(max_entries=MEMORY_HISTORY_MAX_ENTRIES)
+    timings = []
+    for _ in range(measurement_steps):
+        synchronize(device)
+        start = timeit.default_timer()
+        run_step()
+        synchronize(device)
+        timings.append(timeit.default_timer() - start)
 
-    try:
-        timings = []
-        for _ in range(measurement_steps):
-            synchronize(device)
-            start = timeit.default_timer()
-            run_step()
-            synchronize(device)
-            timings.append(timeit.default_timer() - start)
-
-        if recording_memory:
-            torch.cuda.memory._dump_snapshot(str(memory_snapshot))
-    finally:
-        if recording_memory:
-            torch.cuda.memory._record_memory_history(enabled=None)
+    if memory_snapshot is not None:
+        torch.cuda.memory._dump_snapshot(str(memory_snapshot))
 
     return timings
 
@@ -230,48 +242,49 @@ def main() -> None:
 
     device = resolve_device(args.device)
     validate_memory_profile_args(args, device)
-    model = build_model(args, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    inputs, targets = make_batch(args, device)
+    with memory_history(args.memory_snapshot, device):
+        model = build_model(args, device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        inputs, targets = make_batch(args, device)
 
-    if args.mode == "all":
-        modes = ["forward", "forward_backward", "train"]
-    elif args.mode == "compare":
-        modes = ["forward", "forward_backward"]
-    else:
-        modes = [args.mode]
+        if args.mode == "all":
+            modes = ["forward", "forward_backward", "train"]
+        elif args.mode == "compare":
+            modes = ["forward", "forward_backward"]
+        else:
+            modes = [args.mode]
 
-    autocast_dtype = "bfloat16" if args.mixed_precision else "disabled"
-    print(f"device={device} parameter_dtype={args.dtype} autocast={autocast_dtype} size={args.size}")
-    print(
-        f"batch_size={args.batch_size} context_length={args.context_length} "
-        f"vocab_size={args.vocab_size} parameters={sum(p.numel() for p in model.parameters()):,}"
-    )
-    print(f"warmup_steps={args.warmup_steps} measurement_steps={args.measurement_steps}")
-
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-
-    for mode in modes:
-        timings = benchmark_mode(
-            mode=mode,
-            model=model,
-            optimizer=optimizer,
-            inputs=inputs,
-            targets=targets,
-            warmup_steps=args.warmup_steps,
-            measurement_steps=args.measurement_steps,
-            device=device,
-            mixed_precision=args.mixed_precision,
-            memory_snapshot=args.memory_snapshot,
+        autocast_dtype = "bfloat16" if args.mixed_precision else "disabled"
+        print(f"device={device} parameter_dtype={args.dtype} autocast={autocast_dtype} size={args.size}")
+        print(
+            f"batch_size={args.batch_size} context_length={args.context_length} "
+            f"vocab_size={args.vocab_size} parameters={sum(p.numel() for p in model.parameters()):,}"
         )
-        print(format_stats(mode, timings))
+        print(f"warmup_steps={args.warmup_steps} measurement_steps={args.measurement_steps}")
 
-    if device.type == "cuda":
-        peak_gib = torch.cuda.max_memory_allocated(device) / 1024**3
-        print(f"peak_cuda_memory={peak_gib:.3f} GiB")
-    if args.memory_snapshot is not None:
-        print(f"memory_snapshot={args.memory_snapshot.resolve()}")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+
+        for mode in modes:
+            timings = benchmark_mode(
+                mode=mode,
+                model=model,
+                optimizer=optimizer,
+                inputs=inputs,
+                targets=targets,
+                warmup_steps=args.warmup_steps,
+                measurement_steps=args.measurement_steps,
+                device=device,
+                mixed_precision=args.mixed_precision,
+                memory_snapshot=args.memory_snapshot,
+            )
+            print(format_stats(mode, timings))
+
+        if device.type == "cuda":
+            peak_gib = torch.cuda.max_memory_allocated(device) / 1024**3
+            print(f"peak_cuda_memory={peak_gib:.3f} GiB")
+        if args.memory_snapshot is not None:
+            print(f"memory_snapshot={args.memory_snapshot.resolve()}")
 
 
 if __name__ == "__main__":
