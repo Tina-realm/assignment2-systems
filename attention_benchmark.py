@@ -241,7 +241,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     validate_args(args, device)
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(device.index if device.index is not None else 0)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(BenchmarkResult.__dataclass_fields__)
