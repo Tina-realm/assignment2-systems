@@ -5,6 +5,7 @@ import csv
 import gc
 import statistics
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -16,10 +17,12 @@ from cs336_basics.model import scaled_dot_product_attention
 DEFAULT_D_MODELS = [16, 32, 64, 128]
 DEFAULT_SEQUENCE_LENGTHS = [256, 1024, 4096, 8192, 16384]
 MIB = 1024**2
+AttentionFunction = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 @dataclass
 class BenchmarkResult:
+    implementation: str
     d_model: int
     sequence_length: int
     forward_mean_ms: float | None
@@ -72,6 +75,7 @@ def allocate_inputs(
 
 
 def benchmark_forward(
+    attention: AttentionFunction,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -80,7 +84,7 @@ def benchmark_forward(
     device: torch.device,
 ) -> tuple[float, float]:
     for _ in range(warmup_steps):
-        output = scaled_dot_product_attention(q, k, v)
+        output = attention(q, k, v)
         synchronize(device)
         del output
 
@@ -88,7 +92,7 @@ def benchmark_forward(
     for _ in range(measurement_steps):
         synchronize(device)
         start = time.perf_counter()
-        output = scaled_dot_product_attention(q, k, v)
+        output = attention(q, k, v)
         synchronize(device)
         timings.append(time.perf_counter() - start)
         del output
@@ -96,11 +100,15 @@ def benchmark_forward(
 
 
 def measure_memory_before_backward(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, device: torch.device
+    attention: AttentionFunction,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    device: torch.device,
 ) -> tuple[int, int]:
     synchronize(device)
     baseline_memory = torch.cuda.memory_allocated(device)
-    output = scaled_dot_product_attention(q, k, v)
+    output = attention(q, k, v)
     loss = output.sum()
     synchronize(device)
     memory_before_backward = torch.cuda.memory_allocated(device)
@@ -109,6 +117,7 @@ def measure_memory_before_backward(
 
 
 def benchmark_backward(
+    attention: AttentionFunction,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -117,7 +126,7 @@ def benchmark_backward(
     device: torch.device,
 ) -> tuple[float, float]:
     for _ in range(warmup_steps):
-        output = scaled_dot_product_attention(q, k, v)
+        output = attention(q, k, v)
         loss = output.sum()
         loss.backward()
         synchronize(device)
@@ -126,7 +135,7 @@ def benchmark_backward(
 
     timings = []
     for _ in range(measurement_steps):
-        output = scaled_dot_product_attention(q, k, v)
+        output = attention(q, k, v)
         loss = output.sum()
         synchronize(device)
         start = time.perf_counter()
@@ -138,9 +147,10 @@ def benchmark_backward(
     return mean_and_std_ms(timings)
 
 
-def empty_result(d_model: int, sequence_length: int, batch_size: int) -> BenchmarkResult:
+def empty_result(implementation: str, d_model: int, sequence_length: int, batch_size: int) -> BenchmarkResult:
     element_size = torch.empty((), dtype=torch.float32).element_size()
     return BenchmarkResult(
+        implementation=implementation,
         d_model=d_model,
         sequence_length=sequence_length,
         forward_mean_ms=None,
@@ -156,6 +166,8 @@ def empty_result(d_model: int, sequence_length: int, batch_size: int) -> Benchma
 
 
 def run_case(
+    implementation: str,
+    attention: AttentionFunction,
     d_model: int,
     sequence_length: int,
     batch_size: int,
@@ -163,7 +175,7 @@ def run_case(
     measurement_steps: int,
     device: torch.device,
 ) -> BenchmarkResult:
-    result = empty_result(d_model, sequence_length, batch_size)
+    result = empty_result(implementation, d_model, sequence_length, batch_size)
 
     try:
         q, k, v = allocate_inputs(batch_size, sequence_length, d_model, device)
@@ -173,14 +185,14 @@ def run_case(
 
     try:
         result.forward_mean_ms, result.forward_std_ms = benchmark_forward(
-            q, k, v, warmup_steps, measurement_steps, device
+            attention, q, k, v, warmup_steps, measurement_steps, device
         )
     except torch.OutOfMemoryError:
         result.status = "OOM during forward"
         return result
 
     try:
-        memory_before_backward, forward_graph_delta = measure_memory_before_backward(q, k, v, device)
+        memory_before_backward, forward_graph_delta = measure_memory_before_backward(attention, q, k, v, device)
         result.memory_before_backward_mib = memory_before_backward / MIB
         result.forward_graph_delta_mib = forward_graph_delta / MIB
     except torch.OutOfMemoryError:
@@ -189,7 +201,7 @@ def run_case(
 
     try:
         result.backward_mean_ms, result.backward_std_ms = benchmark_backward(
-            q, k, v, warmup_steps, measurement_steps, device
+            attention, q, k, v, warmup_steps, measurement_steps, device
         )
     except torch.OutOfMemoryError:
         result.status = "OOM during backward"
@@ -205,7 +217,7 @@ def format_number(value: float | None) -> str:
 
 def print_result(result: BenchmarkResult) -> None:
     print(
-        f"{result.d_model:7d} {result.sequence_length:8d} "
+        f"{result.implementation:>10} {result.d_model:7d} {result.sequence_length:8d} "
         f"{format_number(result.forward_mean_ms):>12} "
         f"{format_number(result.backward_mean_ms):>12} "
         f"{format_number(result.memory_before_backward_mib):>18} "
@@ -222,6 +234,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-lengths", type=int, nargs="+", default=DEFAULT_SEQUENCE_LENGTHS)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=100)
+    parser.add_argument(
+        "--implementation",
+        choices=["eager", "compiled", "both"],
+        default="eager",
+        help="Benchmark eager attention, torch.compile attention, or both.",
+    )
     parser.add_argument("--output", type=Path, default=Path("attention_benchmark.csv"))
     return parser.parse_args()
 
@@ -249,9 +267,19 @@ def main() -> None:
     print(f"device={torch.cuda.get_device_name(device)} batch_size={args.batch_size} dtype=float32")
     print(f"warmup_steps={args.warmup_steps} measurement_steps={args.measurement_steps}")
     print(
-        f"{'d_model':>7} {'seq_len':>8} {'forward_ms':>12} {'backward_ms':>12} "
+        f"{'impl':>10} {'d_model':>7} {'seq_len':>8} {'forward_ms':>12} {'backward_ms':>12} "
         f"{'before_backward_MiB':>18} {'graph_delta_MiB':>17}  status"
     )
+
+    if args.implementation == "both":
+        implementations = ["eager", "compiled"]
+    else:
+        implementations = [args.implementation]
+
+    attention_functions: dict[str, AttentionFunction] = {"eager": scaled_dot_product_attention}
+    if "compiled" in implementations:
+        # Dynamic shapes avoid hitting torch.compile's recompilation limit over the 20 input shapes.
+        attention_functions["compiled"] = torch.compile(scaled_dot_product_attention, dynamic=True)
 
     with args.output.open("w", newline="") as output_file:
         writer = csv.DictWriter(output_file, fieldnames=fieldnames)
@@ -259,23 +287,26 @@ def main() -> None:
 
         for d_model in args.d_models:
             for sequence_length in args.sequence_lengths:
-                clear_cuda_memory(device)
-                try:
-                    result = run_case(
-                        d_model=d_model,
-                        sequence_length=sequence_length,
-                        batch_size=args.batch_size,
-                        warmup_steps=args.warmup_steps,
-                        measurement_steps=args.measurement_steps,
-                        device=device,
-                    )
-                except torch.OutOfMemoryError:
-                    result = empty_result(d_model, sequence_length, args.batch_size)
-                    result.status = "OOM during cleanup"
+                for implementation in implementations:
+                    clear_cuda_memory(device)
+                    try:
+                        result = run_case(
+                            implementation=implementation,
+                            attention=attention_functions[implementation],
+                            d_model=d_model,
+                            sequence_length=sequence_length,
+                            batch_size=args.batch_size,
+                            warmup_steps=args.warmup_steps,
+                            measurement_steps=args.measurement_steps,
+                            device=device,
+                        )
+                    except torch.OutOfMemoryError:
+                        result = empty_result(implementation, d_model, sequence_length, args.batch_size)
+                        result.status = "OOM during cleanup"
 
-                writer.writerow(asdict(result))
-                output_file.flush()
-                print_result(result)
+                    writer.writerow(asdict(result))
+                    output_file.flush()
+                    print_result(result)
 
     print(f"results={args.output.resolve()}")
 
