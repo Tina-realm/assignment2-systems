@@ -130,7 +130,7 @@ def memory_history(memory_snapshot: Path | None, device: torch.device):
 
 def benchmark_mode(
     mode: str,
-    model: BasicsTransformerLM,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -216,6 +216,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep model parameters in FP32 and autocast the forward pass to BF16.",
     )
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Compile the entire Transformer with torch.compile before benchmarking.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
@@ -241,9 +246,13 @@ def main() -> None:
         raise ValueError("--mixed-precision requires --dtype float32 so parameters remain in FP32.")
 
     device = resolve_device(args.device)
+    if args.compile_model and device.type != "cuda":
+        raise ValueError("--compile-model requires a CUDA device for this assignment benchmark.")
     validate_memory_profile_args(args, device)
     with memory_history(args.memory_snapshot, device):
         model = build_model(args, device)
+        if args.compile_model:
+            model = torch.compile(model)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
         inputs, targets = make_batch(args, device)
 
@@ -255,7 +264,11 @@ def main() -> None:
             modes = [args.mode]
 
         autocast_dtype = "bfloat16" if args.mixed_precision else "disabled"
-        print(f"device={device} parameter_dtype={args.dtype} autocast={autocast_dtype} size={args.size}")
+        implementation = "compiled" if args.compile_model else "eager"
+        print(
+            f"device={device} implementation={implementation} parameter_dtype={args.dtype} "
+            f"autocast={autocast_dtype} size={args.size}"
+        )
         print(
             f"batch_size={args.batch_size} context_length={args.context_length} "
             f"vocab_size={args.vocab_size} parameters={sum(p.numel() for p in model.parameters()):,}"
