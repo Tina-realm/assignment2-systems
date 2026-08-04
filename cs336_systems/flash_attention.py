@@ -114,6 +114,47 @@ else:
     flash_fwd_kernel = None
 
 
+def _flash_attention_backward_impl(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    output: torch.Tensor,
+    dO: torch.Tensor,
+    L: torch.Tensor,
+    is_causal: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    d = Q.shape[-1]
+    scale = 1.0 / math.sqrt(d)
+
+    q = Q.float()
+    k = K.float()
+    v = V.float()
+    output_float = output.float()
+    dO_float = dO.float()
+    L_float = L.float()
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if is_causal:
+        n_queries = Q.shape[-2]
+        n_keys = K.shape[-2]
+        causal_mask = torch.arange(n_queries, device=Q.device)[None, :, None] >= torch.arange(n_keys, device=Q.device)[None, None, :]
+        scores = torch.where(causal_mask, scores, -1e6)
+
+    p = torch.exp(scores - L_float[..., None])
+    D = torch.sum(output_float * dO_float, dim=-1)
+
+    dV = torch.matmul(p.transpose(-2, -1), dO_float)
+    dP = torch.matmul(dO_float, v.transpose(-2, -1))
+    dS = p * (dP - D[..., None])
+    dQ = torch.matmul(dS, k) * scale
+    dK = torch.matmul(dS.transpose(-2, -1), q) * scale
+
+    return dQ.to(dtype=Q.dtype), dK.to(dtype=K.dtype), dV.to(dtype=V.dtype)
+
+
+_flash_attention_backward = torch.compile(_flash_attention_backward_impl)
+
+
 class FlashAttention2PyTorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
@@ -164,7 +205,9 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO: torch.Tensor):
-        raise NotImplementedError
+        L, Q, K, V, output = ctx.saved_tensors
+        dQ, dK, dV = _flash_attention_backward(Q, K, V, output, dO, L, ctx.is_causal)
+        return dQ, dK, dV, None
 
 
 class FlashAttention2Triton(torch.autograd.Function):
@@ -219,4 +262,6 @@ class FlashAttention2Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO: torch.Tensor):
-        raise NotImplementedError
+        L, Q, K, V, output = ctx.saved_tensors
+        dQ, dK, dV = _flash_attention_backward(Q, K, V, output, dO, L, ctx.is_causal)
+        return dQ, dK, dV, None
