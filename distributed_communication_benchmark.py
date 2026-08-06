@@ -31,7 +31,7 @@ class AllReduceBenchmarkResult:
     std_ms: float
     min_rank_mean_ms: float
     max_rank_mean_ms: float
-    approx_bandwidth_gbps: float
+    approx_bandwidth_GBps: float
     status: str
 
 
@@ -80,7 +80,7 @@ def make_result(
     std_seconds = statistics.stdev(all_timings) if len(all_timings) > 1 else 0.0
     max_rank_mean_seconds = max(rank_means)
     data_size_bytes = data_size_mb * 1024 * 1024
-    approx_bandwidth_gbps = data_size_bytes / max_rank_mean_seconds / 1e9
+    approx_bandwidth_GBps = data_size_bytes / max_rank_mean_seconds / 1e9
 
     return AllReduceBenchmarkResult(
         backend=backend,
@@ -93,7 +93,7 @@ def make_result(
         std_ms=std_seconds * 1000,
         min_rank_mean_ms=min(rank_means) * 1000,
         max_rank_mean_ms=max_rank_mean_seconds * 1000,
-        approx_bandwidth_gbps=approx_bandwidth_gbps,
+        approx_bandwidth_GBps=approx_bandwidth_GBps,
         status="ok",
     )
 
@@ -164,7 +164,7 @@ def print_result(result: AllReduceBenchmarkResult) -> None:
         f"{result.backend:>5} {result.world_size:10d} {result.data_size_mb:12d} "
         f"{result.mean_ms:10.3f} {result.std_ms:9.3f} "
         f"{result.min_rank_mean_ms:16.3f} {result.max_rank_mean_ms:16.3f} "
-        f"{result.approx_bandwidth_gbps:18.3f}  {result.status}"
+        f"{result.approx_bandwidth_GBps:18.3f}  {result.status}"
     )
 
 
