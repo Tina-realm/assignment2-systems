@@ -167,6 +167,8 @@ def run_training_step(
         ddp_model.finish_gradient_synchronization()
     elif sync_mode == "flat":
         ddp_model.finish_flat_gradient_synchronization()
+    elif sync_mode == "overlap":
+        ddp_model.finish_gradient_synchronization()
     else:
         raise ValueError(f"Unknown synchronization mode: {sync_mode}")
     synchronize(device)
@@ -222,7 +224,7 @@ def benchmark_worker(rank: int, world_size: int, master_port: int, args: argpars
 
     torch.manual_seed(args.seed)
     model = build_model(args, device)
-    ddp_model = DistributedDataParallel(model)
+    ddp_model = DistributedDataParallel(model, overlap_gradients=args.sync_mode == "overlap")
     optimizer = make_optimizer(args, ddp_model)
     inputs, targets = make_local_batch(args, rank, local_batch_size, device)
     parameter_count = sum(parameter.numel() for parameter in ddp_model.parameters())
@@ -278,9 +280,9 @@ def print_result(result: NaiveDDPBenchmarkResult) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark DDP training with individual or flattened gradient all-reduces.")
+    parser = argparse.ArgumentParser(description="Benchmark DDP training with individual, flattened, or overlapped gradient all-reduces.")
     parser.add_argument("--backend", choices=["nccl", "gloo"], default="nccl")
-    parser.add_argument("--sync-modes", choices=["individual", "flat"], nargs="+", default=["individual"])
+    parser.add_argument("--sync-modes", choices=["individual", "flat", "overlap"], nargs="+", default=["individual"])
     parser.add_argument("--model-size", choices=MODEL_SIZES.keys(), default="xl")
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int, default=4)
