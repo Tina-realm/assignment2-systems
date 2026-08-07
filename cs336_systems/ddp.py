@@ -6,10 +6,14 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 class DistributedDataParallel(torch.nn.Module):
-    def __init__(self, module: torch.nn.Module):
+    def __init__(self, module: torch.nn.Module, overlap_gradients: bool = True):
         super().__init__()
         self.module = module
+        self.overlap_gradients = overlap_gradients
+        self._gradient_handles = []
+        self._hook_handles = []
         self._broadcast_module_state()
+        self._register_gradient_hooks()
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
@@ -23,11 +27,38 @@ class DistributedDataParallel(torch.nn.Module):
         for buffer in self.module.buffers():
             dist.broadcast(buffer.data, src=0)
 
+    def _register_gradient_hooks(self) -> None:
+        if not self.overlap_gradients:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        for parameter in self.module.parameters():
+            if parameter.requires_grad:
+                self._hook_handles.append(parameter.register_post_accumulate_grad_hook(self._make_gradient_hook()))
+
+    def _make_gradient_hook(self):
+        def hook(parameter: torch.Tensor) -> None:
+            if parameter.grad is None:
+                return
+            handle = dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM, async_op=True)
+            self._gradient_handles.append((handle, parameter))
+
+        return hook
+
     def finish_gradient_synchronization(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
             return
 
         world_size = dist.get_world_size()
+        if self.overlap_gradients:
+            for handle, parameter in self._gradient_handles:
+                handle.wait()
+                if parameter.grad is not None:
+                    parameter.grad.div_(world_size)
+            self._gradient_handles.clear()
+            return
+
         for parameter in self.module.parameters():
             if parameter.grad is None:
                 continue
