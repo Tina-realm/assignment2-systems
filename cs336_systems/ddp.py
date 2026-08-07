@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 
 class DistributedDataParallel(torch.nn.Module):
@@ -32,3 +33,19 @@ class DistributedDataParallel(torch.nn.Module):
                 continue
             dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
             parameter.grad.div_(world_size)
+
+    def finish_flat_gradient_synchronization(self) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        parameters_with_grad = [parameter for parameter in self.module.parameters() if parameter.grad is not None]
+        if not parameters_with_grad:
+            return
+
+        gradients = [parameter.grad for parameter in parameters_with_grad]
+        flat_gradients = _flatten_dense_tensors(gradients)
+        dist.all_reduce(flat_gradients, op=dist.ReduceOp.SUM)
+        flat_gradients.div_(dist.get_world_size())
+
+        for parameter, synced_gradient in zip(parameters_with_grad, _unflatten_dense_tensors(flat_gradients, gradients), strict=True):
+            parameter.grad.copy_(synced_gradient)
