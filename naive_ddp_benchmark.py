@@ -45,6 +45,7 @@ MODEL_SIZES = {
 @dataclass
 class NaiveDDPBenchmarkResult:
     backend: str
+    sync_mode: str
     model_size: str
     world_size: int
     global_batch_size: int
@@ -151,6 +152,7 @@ def run_training_step(
     targets: torch.Tensor,
     device: torch.device,
     mixed_precision: bool,
+    sync_mode: str,
 ) -> float:
     optimizer.zero_grad(set_to_none=True)
 
@@ -161,7 +163,12 @@ def run_training_step(
 
     synchronize(device)
     comm_start = time.perf_counter()
-    ddp_model.finish_gradient_synchronization()
+    if sync_mode == "individual":
+        ddp_model.finish_gradient_synchronization()
+    elif sync_mode == "flat":
+        ddp_model.finish_flat_gradient_synchronization()
+    else:
+        raise ValueError(f"Unknown synchronization mode: {sync_mode}")
     synchronize(device)
     comm_seconds = time.perf_counter() - comm_start
 
@@ -186,6 +193,7 @@ def make_result(
     comm_mean = statistics.fmean(all_comm_timings)
     return NaiveDDPBenchmarkResult(
         backend=args.backend,
+        sync_mode=args.sync_mode,
         model_size=args.model_size,
         world_size=world_size,
         global_batch_size=args.global_batch_size,
@@ -221,7 +229,7 @@ def benchmark_worker(rank: int, world_size: int, master_port: int, args: argpars
 
     ddp_model.train()
     for _ in range(args.warmup_steps):
-        run_training_step(ddp_model, optimizer, inputs, targets, device, args.mixed_precision)
+        run_training_step(ddp_model, optimizer, inputs, targets, device, args.mixed_precision, args.sync_mode)
         synchronize(device)
 
     dist.barrier()
@@ -231,7 +239,7 @@ def benchmark_worker(rank: int, world_size: int, master_port: int, args: argpars
         synchronize(device)
         dist.barrier()
         step_start = time.perf_counter()
-        comm_seconds = run_training_step(ddp_model, optimizer, inputs, targets, device, args.mixed_precision)
+        comm_seconds = run_training_step(ddp_model, optimizer, inputs, targets, device, args.mixed_precision, args.sync_mode)
         synchronize(device)
         step_seconds = time.perf_counter() - step_start
         step_timings.append(step_seconds)
@@ -262,7 +270,7 @@ def benchmark_worker(rank: int, world_size: int, master_port: int, args: argpars
 
 def print_result(result: NaiveDDPBenchmarkResult) -> None:
     print(
-        f"{result.backend:>5} {result.model_size:>6} {result.world_size:5d} "
+        f"{result.backend:>5} {result.sync_mode:>10} {result.model_size:>6} {result.world_size:5d} "
         f"{result.global_batch_size:8d} {result.context_length:8d} "
         f"{result.step_mean_ms:12.3f} {result.comm_mean_ms:12.3f} "
         f"{result.comm_fraction * 100:9.2f}% {result.max_rank_step_mean_ms:16.3f}  {result.status}"
@@ -270,8 +278,9 @@ def print_result(result: NaiveDDPBenchmarkResult) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark naïve DDP training with individual gradient all-reduces.")
+    parser = argparse.ArgumentParser(description="Benchmark DDP training with individual or flattened gradient all-reduces.")
     parser.add_argument("--backend", choices=["nccl", "gloo"], default="nccl")
+    parser.add_argument("--sync-modes", choices=["individual", "flat"], nargs="+", default=["individual"])
     parser.add_argument("--model-size", choices=MODEL_SIZES.keys(), default="xl")
     parser.add_argument("--world-size", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int, default=4)
@@ -317,17 +326,19 @@ def main() -> None:
 
     print(f"output={args.output.resolve()}")
     print(
-        f"{'bkd':>5} {'model':>6} {'world':>5} {'glob_bs':>8} {'ctx':>8} "
+        f"{'bkd':>5} {'sync':>10} {'model':>6} {'world':>5} {'glob_bs':>8} {'ctx':>8} "
         f"{'step_ms':>12} {'comm_ms':>12} {'comm_pct':>10} {'max_rank_step_ms':>16}  status"
     )
 
-    master_port = find_free_port()
-    mp.spawn(
-        benchmark_worker,
-        args=(args.world_size, master_port, args),
-        nprocs=args.world_size,
-        join=True,
-    )
+    for sync_mode in args.sync_modes:
+        args.sync_mode = sync_mode
+        master_port = find_free_port()
+        mp.spawn(
+            benchmark_worker,
+            args=(args.world_size, master_port, args),
+            nprocs=args.world_size,
+            join=True,
+        )
     print(f"results={args.output.resolve()}")
 
 
